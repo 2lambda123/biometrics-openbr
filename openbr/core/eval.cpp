@@ -60,6 +60,11 @@ struct OperatingPoint
         : score(_score), FAR(_FAR), TAR(_TAR) {}
 };
 
+/*
+ * Find the operating point where the key equals the provided value.
+ * If no such explicit point exists, we perform interpolation between the two nearest points.
+ * We make the assumption that scores are monotonically increasing or decreasing, hence no two points can have the same score.
+ */
 static OperatingPoint getOperatingPoint(const QList<OperatingPoint> &operatingPoints, const QString key, const float value)
 {
     bool invert      = (key == "Score") && (operatingPoints.first().score > operatingPoints.last().score);
@@ -105,11 +110,17 @@ static OperatingPoint getOperatingPoint(const QList<OperatingPoint> &operatingPo
     const float mScore = (score2 - score1) / denFAR;
     const float bScore = score1 - mScore*FAR1;
 
+    OperatingPoint op;
     if (key == "Score")
-        return OperatingPoint(value, mFAR*value + bFAR, mTAR*value + bTAR);
+        op = OperatingPoint(value, mFAR*value + bFAR, mTAR*value + bTAR);
     else if (key == "FAR")
-        return OperatingPoint(mScore * value + bScore, value, mTAR * value + bTAR);
-    return OperatingPoint(mScore * ((value - bTAR) / mTAR) + bScore, (value - bTAR) / mTAR, value);
+        op = OperatingPoint(mScore * value + bScore, value, mTAR * value + bTAR);
+    else
+        op = OperatingPoint(mScore * ((value - bTAR) / mTAR) + bScore, (value - bTAR) / mTAR, value);
+    op.score = MIN(score2, MAX(score1, op.score)); // Ensure the interpolation is between the two points
+    op.FAR = MIN(FAR2, MAX(FAR1, op.FAR)); // Ensure the interpolation is between the two points
+    op.TAR = MIN(TAR2, MAX(TAR1, op.TAR)); // Ensure the interpolation is between the two points
+    return op;
 }
 
 static float getCMC(const QVector<int> &firstGenuineReturns, int rank, size_t possibleReturns = 0)
@@ -1469,14 +1480,17 @@ void EvalKNN(const QString &knnGraph, const QString &knnTruth, const QString &cs
     qDebug("FNIR @ FPIR = 0.01:  %.3f", 1-getOperatingPoint(operatingPoints, "FAR", 0.01).TAR);
 }
 
-void EvalEER(const QString &predictedXML, QString gt_property, QString distribution_property, const QString &csv) {
-    if (gt_property.isEmpty())
-        gt_property = "Label";
-    if (distribution_property.isEmpty())
-        distribution_property = "Fusion";
+struct EERSummary
+{
+    float eer = 0.f, eer_thresh = 0.f;
+    int classOneTemplates = 0, classZeroTemplates = 0;
+    OperatingPoint faratfrr1 = OperatingPoint(0.f, 0.f, 0.f), faratfrr5 = OperatingPoint(0.f, 0.f, 0.f);
+    OperatingPoint frratfar1 = OperatingPoint(0.f, 0.f, 0.f), frratfar5 = OperatingPoint(0.f, 0.f, 0.f);
+};
+
+EERSummary EvalEER(const TemplateList templateList, QString gt, QString score, const QString &csv, bool return_eer_early = false) {
     int classOneTemplateCount = 0;
     int classZeroTemplateCount = 0;
-    const TemplateList templateList(TemplateList::fromGallery(predictedXML));
 
     QList<QPair<float, int>> scores;
     QList<float> classZeroScores, classOneScores;
@@ -1485,11 +1499,13 @@ void EvalEER(const QString &predictedXML, QString gt_property, QString distribut
     float minClassZeroScore = std::numeric_limits<float>::max();
     float maxClassZeroScore = 0;
     for (int i=0; i<templateList.size(); i++) {
-        if (!templateList[i].file.contains(distribution_property) || !templateList[i].file.contains(gt_property))
+        if (!templateList[i].file.contains(score) || !templateList[i].file.contains(gt))
             continue;
 
-        const int gtLabel = templateList[i].file.get<int>(gt_property);
-        const float templateScore = templateList[i].file.get<float>(distribution_property);
+        const int gtLabel = templateList[i].file.get<int>(gt);
+        const float templateScore = templateList[i].file.get<float>(score);
+        if (gtLabel < 0)
+            continue;
         scores.append(qMakePair(templateScore, gtLabel));
 
         if (gtLabel == 1) {
@@ -1516,7 +1532,7 @@ void EvalEER(const QString &predictedXML, QString gt_property, QString distribut
     int falsePositives = 0;
     int truePositives = 0;
     size_t index = 0;
-    float minDiff = 100, EER = 100, EERThres = 0;
+    float minDiff = 100, EER = 100, EERThresh = 0;
     float threshold = 0;
 
     while (index < scores.size()) {
@@ -1540,12 +1556,20 @@ void EvalEER(const QString &predictedXML, QString gt_property, QString distribut
         if (diff < minDiff) {
             minDiff = diff;
             EER = (FAR+FRR)/2.0;
-            EERThres = threshold;
+            EERThresh = threshold;
         }
     }
 
     operatingPoints.append(OperatingPoint(MAX(maxClassOneScore,maxClassZeroScore),1,1));
     operatingPoints.prepend(OperatingPoint(MIN(minClassOneScore,minClassZeroScore),0,0));
+
+    EERSummary summary = {
+        EER, EERThresh, classOneTemplateCount, classZeroTemplateCount,
+        getOperatingPoint(operatingPoints, "TAR", 0.99), getOperatingPoint(operatingPoints, "TAR", 0.95),
+        getOperatingPoint(operatingPoints, "FAR", 0.01), getOperatingPoint(operatingPoints, "FAR", 0.05)
+    };
+    if (return_eer_early)
+        return summary;
 
     printf("\n==========================================================\n");
     printf("Class 0 Templates: %d\tClass 1 Templates: %d\tTotal Templates: %d\n",
@@ -1573,7 +1597,7 @@ void EvalEER(const QString &predictedXML, QString gt_property, QString distribut
 
     }
     printf("----------------------------------------------------------\n");
-    printf("EER: %.3f @ Threshold %.3f\n", EER*100, EERThres);
+    printf("EER: %.3f @ Threshold %.3f\n", EER*100, EERThresh);
     printf("==========================================================\n\n");
 
     QString thresh, form, frr, far;
@@ -1667,6 +1691,100 @@ void EvalEER(const QString &predictedXML, QString gt_property, QString distribut
         }
 
         QtUtils::writeFile(csv, lines);
+    }
+
+    return summary;
+}
+
+void EvalEER(const QString &gallery, QString gt, QString score, const QString &csv) {
+    if (gt.isEmpty())
+        gt = "Label";
+    if (score.isEmpty())
+        score = "Fusion";
+    const TemplateList templateList(TemplateList::fromGallery(gallery));
+    EvalEER(templateList, gt, score, csv, false);
+}
+
+void EvalErrorDiscard(const QString func, const QString &gallery, QString gt, QString score, const QString quality, bool invert) {
+    printf("\nEvaluating quality metric `%s` on gallery `%s` using gt `%s` for score `%s` with evaluation function `%s`\n",
+        qPrintable(quality), qPrintable(gallery), qPrintable(gt), qPrintable(score), qPrintable(func));
+    TemplateList predicted(TemplateList::fromGallery(gallery));
+
+    QList<float> qualities;
+    float threshMin = FLT_MAX, threshMax = FLT_MIN;
+    int startingGenuineCount = 0;
+    CorrelationCounter cc;
+    for (int i=0; i<predicted.size(); i++) {
+        if (predicted[i].file.contains(gt) && predicted[i].file.contains(score) && predicted[i].file.contains(quality)) {
+            float qualityValue = predicted[i].file.get<float>(quality);
+            if (func == "evalEER") {
+                if (predicted[i].file.get<float>(gt) == 1) {
+                    qualities << qualityValue;
+                    startingGenuineCount++;
+                    cc.add_sample(predicted[i].file.get<float>(score), qualityValue);
+                } else
+                    continue; // For evalEER, we only care about filtering by quality for genuine samples
+            }
+
+            if (qualityValue < threshMin) threshMin = qualityValue;
+            if (qualityValue > threshMax) threshMax = qualityValue;
+        } else {
+            printf("\nSample at index %d does not contain all required metadata!\n", i);
+        }
+    }
+    std::sort(qualities.begin(), qualities.end()); // We need sorted qualities to fetch at % thresholds later
+    printf("Minimum Quality: %.3f\nMaximum Quality: %.3f\n", threshMin, threshMax);
+    printf("Correlation: %.3f\n\n", cc.correlation_coefficient());
+
+    QList<QString> errors;
+    QList<QString> discards;
+
+    // Print out the table header
+    if (func == "evalEER") {
+        printf("| Quality Thresh |  EER  | EER Thresh | FAR @ FRR=1%% | FAR @ FRR=5%% | FRR @ FAR=1%% | FRR @ FAR=5%% | # Genuine Removed |  %% Genuine Removed |\n");
+        printf("|      :---:     | :---: |    :---:   |     :---:    |     :---:    |     :---:    |     :---:    |       :---:       |        :---:       |\n");
+    }
+
+    foreach (float bin, QList<float>() << 0 << 0.1 << 0.5 << 1 << 5 << 10 << 15 << 20 ) {
+        int thresh_index = MIN(qualities.size() - 1, MAX(0, (int)(bin * qualities.size() / 100.f)));
+        float thresh = qualities[invert ? qualities.size() - 1 - thresh_index : thresh_index];
+        if (func == "evalEER") {
+            for (int i = 0; i < predicted.size(); i++) {
+                if ((invert ? predicted[i].file.get<float>(quality) > thresh : predicted[i].file.get<float>(quality) < thresh)) {
+                    if (predicted[i].file.get<float>(gt) == 1)
+                        predicted[i].file.set(gt, -1.f); // Remove any genuine samples worse than the quality
+                }
+            }
+            EERSummary summary = EvalEER(predicted, gt, score, "", true);
+            int removed = startingGenuineCount - summary.classOneTemplates;
+            errors << QString("%1").arg(QString::number(summary.eer));
+            discards << QString("%1").arg(QString::number(removed * 100.f / startingGenuineCount));
+            printf("| %*.3f | %*.2f | %*.2f | %*.1f | %*.1f | %*.1f | %*.1f | %*d | %*.2f |\n",
+                14, thresh, 5, 100 * summary.eer, 10, summary.eer_thresh,
+                12, 100 * summary.faratfrr1.FAR, 12, 100 * summary.faratfrr5.FAR,
+                12, 100 * (1 - summary.frratfar1.TAR), 12, 100 * (1 - summary.frratfar5.TAR),
+                17, removed, 18, removed * 100.f / startingGenuineCount);
+        }
+    }
+    printf("\n\n");
+
+    bool generatePlot = true;
+    if (generatePlot) {
+        QStringList rSource;
+        rSource << "# Load libraries" << "library(ggplot2)" << "" << "# Set Data"
+                << "Discard <- c(" + discards.join(",") + ")"
+                << "Error <- c(" + errors.join(",") + ")"
+                << "data <- data.frame(Discard, Error)"
+                << "" << "# Construct Plot" << "pdf(\"EvalErrorDiscard.pdf\")"
+                << "print(qplot(Discard, Error, data=data) + scale_x_log10() + coord_cartesian(xlim=c(.1,25)))"
+                << "print(qplot(Discard, Error/" << errors[0] << ", data=data) + scale_x_log10() + coord_cartesian(xlim=c(.1,25)))"
+                << "dev.off()";
+
+
+        QString rFile = "EvalErrorDiscard.R";
+        QtUtils::writeFile(rFile, rSource);
+        bool success = QtUtils::runRScript(rFile);
+        if (success) QtUtils::showFile("EvalErrorDiscard.pdf");
     }
 }
 
